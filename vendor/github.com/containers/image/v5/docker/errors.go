@@ -12,6 +12,7 @@ import (
 var (
 	// ErrV1NotSupported is returned when we're trying to talk to a
 	// docker V1 registry.
+	// Deprecated: The V1 container registry detection is no longer performed, so this error is never returned.
 	ErrV1NotSupported = errors.New("can't talk to a V1 container registry")
 	// ErrTooManyRequests is returned when the status code returned is 429
 	ErrTooManyRequests = errors.New("too many requests to registry")
@@ -88,7 +89,7 @@ func registryHTTPResponseToError(res *http.Response) error {
 			response = response[:50] + "..."
 		}
 		// %.0w makes e visible to error.Unwrap() without including any text
-		err = fmt.Errorf("StatusCode: %d, %s%.0w", e.StatusCode, response, e)
+		err = fmt.Errorf("StatusCode: %d, %q%.0w", e.StatusCode, response, e)
 	case errcode.Error:
 		// e.Error() is fmt.Sprintf("%s: %s", e.Code.Error(), e.Message, which is usually
 		// rather redundant. So reword it without using e.Code.Error() if e.Message is the default.

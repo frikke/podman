@@ -4,13 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
-	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/utils"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/farm"
+	"github.com/containers/common/pkg/completion"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/pkg/farm"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -19,17 +19,19 @@ type buildOptions struct {
 	buildOptions common.BuildFlagsWrapper
 	local        bool
 	platforms    []string
+	farm         string
 }
 
 var (
 	farmBuildDescription = `Build images on farm nodes, then bundle them into a manifest list`
 	buildCommand         = &cobra.Command{
-		Use:     "build [options] [CONTEXT]",
-		Short:   "Build a container image for multiple architectures",
-		Long:    farmBuildDescription,
-		RunE:    build,
-		Example: "podman farm build [flags] buildContextDirectory",
-		Args:    cobra.ExactArgs(1),
+		Use:               "build [options] [CONTEXT]",
+		Short:             "Build a container image for multiple architectures",
+		Long:              farmBuildDescription,
+		RunE:              build,
+		Example:           "podman farm build [flags] buildContextDirectory",
+		ValidArgsFunction: common.AutocompleteDefaultOneArg,
+		Args:              cobra.MaximumNArgs(1),
 	}
 	buildOpts = buildOptions{
 		buildOptions: common.BuildFlagsWrapper{},
@@ -44,15 +46,20 @@ func init() {
 	flags := buildCommand.Flags()
 	flags.SetNormalizeFunc(utils.AliasFlags)
 
-	localFlagName := "local"
-	// Default for local is true and hide this flag for the remote use case
-	if !registry.IsRemote() {
-		flags.BoolVarP(&buildOpts.local, localFlagName, "l", true, "Build image on local machine as well as on farm nodes")
-	}
 	cleanupFlag := "cleanup"
 	flags.BoolVar(&buildOpts.buildOptions.Cleanup, cleanupFlag, false, "Remove built images from farm nodes on success")
+
+	farmFlagName := "farm"
+	flags.StringVar(&buildOpts.farm, farmFlagName, "", "Farm to use for builds")
+	_ = buildCommand.RegisterFlagCompletionFunc(farmFlagName, common.AutoCompleteFarms)
+
+	localFlagName := "local"
+	// Default for local is true
+	flags.BoolVarP(&buildOpts.local, localFlagName, "l", true, "Build image on local machine as well as on farm nodes")
+
 	platformsFlag := "platforms"
 	buildCommand.PersistentFlags().StringSliceVar(&buildOpts.platforms, platformsFlag, nil, "Build only on farm nodes that match the given platforms")
+	_ = buildCommand.RegisterFlagCompletionFunc(platformsFlag, completion.AutocompletePlatform)
 
 	common.DefineBuildFlags(buildCommand, &buildOpts.buildOptions, true)
 }
@@ -68,7 +75,18 @@ func build(cmd *cobra.Command, args []string) error {
 	if !cmd.Flags().Changed("tag") {
 		return errors.New("cannot create manifest list without a name, value for --tag is required")
 	}
-	opts, err := common.ParseBuildOpts(cmd, args, &buildOpts.buildOptions)
+	// Ensure that the user gives a full name so we can push the built images from
+	// the node to the given registry and repository
+	// Should be of the format registry/repository/imageName
+	tag, err := cmd.Flags().GetStringArray("tag")
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(tag[0], "/") {
+		return fmt.Errorf("%q is not a full image reference name", tag[0])
+	}
+	bopts := buildOpts.buildOptions
+	opts, err := common.ParseBuildOpts(cmd, args, &bopts)
 	if err != nil {
 		return err
 	}
@@ -91,28 +109,21 @@ func build(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	opts.IIDFile = iidFile
-
-	cfg, err := config.ReadCustomConfig()
-	if err != nil {
-		return err
-	}
-
-	defaultFarm := cfg.Farms.Default
-	if farmCmd.Flags().Changed("farm") {
-		f, err := farmCmd.Flags().GetString("farm")
+	// only set tls-verify if it has been changed by the user
+	// if it hasn't we will read the registries.conf on the farm
+	// nodes for further configuration
+	if changed := cmd.Flags().Changed("tls-verify"); changed {
+		tlsVerify, err := cmd.Flags().GetBool("tls-verify")
 		if err != nil {
 			return err
 		}
-		defaultFarm = f
+		skipTLSVerify := !tlsVerify
+		opts.SkipTLSVerify = &skipTLSVerify
 	}
 
-	var localEngine entities.ImageEngine
-	if buildOpts.local {
-		localEngine = registry.ImageEngine()
-	}
-
+	localEngine := registry.ImageEngine()
 	ctx := registry.Context()
-	farm, err := farm.NewFarm(ctx, defaultFarm, localEngine)
+	farm, err := farm.NewFarm(ctx, buildOpts.farm, localEngine, buildOpts.local)
 	if err != nil {
 		return fmt.Errorf("initializing: %w", err)
 	}
@@ -126,7 +137,7 @@ func build(cmd *cobra.Command, args []string) error {
 	manifestName := opts.Output
 	// Set Output to "" so that the images built on the farm nodes have no name
 	opts.Output = ""
-	if err = farm.Build(ctx, schedule, *opts, manifestName); err != nil {
+	if err = farm.Build(ctx, schedule, *opts, manifestName, localEngine); err != nil {
 		return fmt.Errorf("build: %w", err)
 	}
 	logrus.Infof("build: ok")

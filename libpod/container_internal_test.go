@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -34,7 +33,7 @@ func TestParseOptionIDs(t *testing.T) {
 	assert.NotNil(t, err)
 
 	mappings, err := parseOptionIDs(idMap, "100-200-2")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, mappings)
 
 	assert.Equal(t, len(mappings), 1)
@@ -44,7 +43,7 @@ func TestParseOptionIDs(t *testing.T) {
 	assert.Equal(t, mappings[0].Size, 2)
 
 	mappings, err = parseOptionIDs(idMap, "100-200-2#300-400-5")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, mappings)
 
 	assert.Equal(t, len(mappings), 2)
@@ -58,7 +57,7 @@ func TestParseOptionIDs(t *testing.T) {
 	assert.Equal(t, mappings[1].Size, 5)
 
 	mappings, err = parseOptionIDs(idMap, "@100-200-2#@300-400-5")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, mappings)
 
 	assert.Equal(t, len(mappings), 2)
@@ -98,7 +97,7 @@ func TestParseIDMapMountOption(t *testing.T) {
 		GIDMap: gidMap,
 	}
 	uids, gids, err := parseIDMapMountOption(options, "idmap")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, len(uids), 1)
 	assert.Equal(t, len(gids), 1)
 
@@ -111,7 +110,7 @@ func TestParseIDMapMountOption(t *testing.T) {
 	assert.Equal(t, gids[0].Size, uint32(10000))
 
 	uids, gids, err = parseIDMapMountOption(options, "idmap=uids=0-1-10#10-11-10;gids=0-3-10")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, len(uids), 2)
 	assert.Equal(t, len(gids), 1)
 

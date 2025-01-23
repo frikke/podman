@@ -1,7 +1,9 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -26,9 +28,7 @@ var _ = Describe("Podman run exit", func() {
 		Expect(pmount).Should(ExitCleanly())
 		Expect(pmount.OutputToString()).To(ContainSubstring(cid))
 
-		stop := podmanTest.Podman([]string{"stop", cid})
-		stop.WaitWithDefaultTimeout()
-		Expect(stop).Should(ExitCleanly())
+		podmanTest.StopContainer(cid)
 
 		// We have to force cleanup so the unmount happens
 		podmanCleanupSession := podmanTest.Podman([]string{"container", "cleanup", cid})
@@ -61,7 +61,7 @@ var _ = Describe("Podman run exit", func() {
 
 		// command: podman <options> unshare podman <options> image mount ALPINE
 		args := []string{"unshare", podmanTest.PodmanBinary}
-		opts := podmanTest.PodmanMakeOptions([]string{"mount", "--no-trunc"}, false, false)
+		opts := podmanTest.PodmanMakeOptions([]string{"mount", "--no-trunc"}, PodmanExecOptions{})
 		args = append(args, opts...)
 
 		pmount := podmanTest.Podman(args)
@@ -69,9 +69,7 @@ var _ = Describe("Podman run exit", func() {
 		Expect(pmount).Should(ExitCleanly())
 		Expect(pmount.OutputToString()).To(ContainSubstring(cid))
 
-		stop := podmanTest.Podman([]string{"stop", cid})
-		stop.WaitWithDefaultTimeout()
-		Expect(stop).Should(ExitCleanly())
+		podmanTest.StopContainer(cid)
 
 		// We have to force cleanup so the unmount happens
 		podmanCleanupSession := podmanTest.Podman([]string{"container", "cleanup", cid})

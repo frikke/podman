@@ -53,7 +53,8 @@ type StoreTransport interface {
 	// can return different images, with no way for the caller to "freeze" the storage.Image identity
 	// without discarding the name entirely.
 	//
-	// Use storage.ResolveReference instead.
+	// Use storage.ResolveReference instead; note that if the image is not found, ResolveReference returns
+	// c/image/v5/storage.ErrNoSuchImage, not c/storage.ErrImageUnknown.
 	GetImage(types.ImageReference) (*storage.Image, error)
 	// GetStoreImage retrieves the image from a specified store that's named
 	// by the reference.
@@ -65,7 +66,8 @@ type StoreTransport interface {
 	//
 	// Also, a StoreTransport reference already contains a store, so providing another one is redundant.
 	//
-	// Use storage.ResolveReference instead.
+	// Use storage.ResolveReference instead; note that if the image is not found, ResolveReference returns
+	// c/image/v5/storage.ErrNoSuchImage, not c/storage.ErrImageUnknown.
 	GetStoreImage(storage.Store, types.ImageReference) (*storage.Image, error)
 	// ParseStoreReference parses a reference, overriding any store
 	// specification that it may contain.
@@ -211,7 +213,7 @@ func (s *storageTransport) GetStore() (storage.Store, error) {
 	// Return the transport's previously-set store.  If we don't have one
 	// of those, initialize one now.
 	if s.store == nil {
-		options, err := storage.DefaultStoreOptionsAutoDetectUID()
+		options, err := storage.DefaultStoreOptions()
 		if err != nil {
 			return nil, err
 		}
@@ -312,7 +314,8 @@ func (s *storageTransport) ParseReference(reference string) (types.ImageReferenc
 //
 // Also, a StoreTransport reference already contains a store, so providing another one is redundant.
 //
-// Use storage.ResolveReference instead.
+// Use storage.ResolveReference instead; note that if the image is not found, ResolveReference returns
+// c/image/v5/storage.ErrNoSuchImage, not c/storage.ErrImageUnknown.
 func (s storageTransport) GetStoreImage(store storage.Store, ref types.ImageReference) (*storage.Image, error) {
 	dref := ref.DockerReference()
 	if dref != nil {
@@ -334,7 +337,8 @@ func (s storageTransport) GetStoreImage(store storage.Store, ref types.ImageRefe
 // can return different images, with no way for the caller to "freeze" the storage.Image identity
 // without discarding the name entirely.
 //
-// Use storage.ResolveReference instead.
+// Use storage.ResolveReference instead; note that if the image is not found, ResolveReference returns
+// c/image/v5/storage.ErrNoSuchImage, not c/storage.ErrImageUnknown.
 func (s *storageTransport) GetImage(ref types.ImageReference) (*storage.Image, error) {
 	store, err := s.GetStore()
 	if err != nil {

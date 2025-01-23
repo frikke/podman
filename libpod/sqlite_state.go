@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -14,8 +13,7 @@ import (
 	"time"
 
 	"github.com/containers/common/libnetwork/types"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v5/libpod/define"
 	"github.com/containers/storage"
 	"github.com/sirupsen/logrus"
 
@@ -69,7 +67,18 @@ func NewSqliteState(runtime *Runtime) (_ State, defErr error) {
 		return nil, fmt.Errorf("creating root directory: %w", err)
 	}
 
-	conn, err := sql.Open("sqlite3", filepath.Join(basePath, sqliteOptions))
+	// Make sure busy timeout is set to high value to keep retrying when the db is locked.
+	// Timeout is in ms, so set it to 100s to have enough time to retry the operations.
+	// Some users might want to experiment with different timeout values (#23236)
+	// DO NOT DOCUMENT or recommend PODMAN_SQLITE_BUSY_TIMEOUT outside of testing.
+	busyTimeout := "100000"
+	if env, ok := os.LookupEnv("PODMAN_SQLITE_BUSY_TIMEOUT"); ok {
+		logrus.Debugf("PODMAN_SQLITE_BUSY_TIMEOUT is set to %s", env)
+		busyTimeout = env
+	}
+	sqliteOptionBusyTimeout := "&_busy_timeout=" + busyTimeout
+
+	conn, err := sql.Open("sqlite3", filepath.Join(basePath, sqliteOptions+sqliteOptionBusyTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("initializing sqlite database: %w", err)
 	}
@@ -299,7 +308,7 @@ func (s *SQLiteState) ValidateDBConfig(runtime *Runtime) (defErr error) {
 		return define.ErrDBClosed
 	}
 
-	storeOpts, err := storage.DefaultStoreOptions(rootless.IsRootless(), rootless.GetRootlessUID())
+	storeOpts, err := storage.DefaultStoreOptions()
 	if err != nil {
 		return err
 	}
@@ -312,14 +321,14 @@ func (s *SQLiteState) ValidateDBConfig(runtime *Runtime) (defErr error) {
         );`
 
 	var (
-		os, staticDir, tmpDir, graphRoot, runRoot, graphDriver, volumePath string
-		runtimeOS                                                          = goruntime.GOOS
-		runtimeStaticDir                                                   = filepath.Clean(s.runtime.config.Engine.StaticDir)
-		runtimeTmpDir                                                      = filepath.Clean(s.runtime.config.Engine.TmpDir)
-		runtimeGraphRoot                                                   = filepath.Clean(s.runtime.StorageConfig().GraphRoot)
-		runtimeRunRoot                                                     = filepath.Clean(s.runtime.StorageConfig().RunRoot)
-		runtimeGraphDriver                                                 = s.runtime.StorageConfig().GraphDriverName
-		runtimeVolumePath                                                  = filepath.Clean(s.runtime.config.Engine.VolumePath)
+		dbOS, staticDir, tmpDir, graphRoot, runRoot, graphDriver, volumePath string
+		runtimeOS                                                            = goruntime.GOOS
+		runtimeStaticDir                                                     = filepath.Clean(s.runtime.config.Engine.StaticDir)
+		runtimeTmpDir                                                        = filepath.Clean(s.runtime.config.Engine.TmpDir)
+		runtimeGraphRoot                                                     = filepath.Clean(s.runtime.StorageConfig().GraphRoot)
+		runtimeRunRoot                                                       = filepath.Clean(s.runtime.StorageConfig().RunRoot)
+		runtimeGraphDriver                                                   = s.runtime.StorageConfig().GraphDriverName
+		runtimeVolumePath                                                    = filepath.Clean(s.runtime.config.Engine.VolumePath)
 	)
 
 	// Some fields may be empty, indicating they are set to the default.
@@ -356,7 +365,7 @@ func (s *SQLiteState) ValidateDBConfig(runtime *Runtime) (defErr error) {
 
 	row := tx.QueryRow("SELECT Os, StaticDir, TmpDir, GraphRoot, RunRoot, GraphDriver, VolumeDir FROM DBConfig;")
 
-	if err := row.Scan(&os, &staticDir, &tmpDir, &graphRoot, &runRoot, &graphDriver, &volumePath); err != nil {
+	if err := row.Scan(&dbOS, &staticDir, &tmpDir, &graphRoot, &runRoot, &graphDriver, &volumePath); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			if _, err := tx.Exec(createRow, 1, schemaVersion, runtimeOS,
 				runtimeStaticDir, runtimeTmpDir, runtimeGraphRoot,
@@ -374,11 +383,29 @@ func (s *SQLiteState) ValidateDBConfig(runtime *Runtime) (defErr error) {
 		return fmt.Errorf("retrieving DB config: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("committing database validation row: %w", err)
-	}
+	checkField := func(fieldName, dbVal, ourVal string, isPath bool) error {
+		if isPath {
+			// Tolerate symlinks when possible - most relevant for OStree systems
+			// and rootless containers, where we want to put containers in /home,
+			// which is symlinked to /var/home.
+			// Ignore ENOENT as reasonable, as some paths may not exist in early Libpod
+			// init.
+			if dbVal != "" {
+				checkedVal, err := evalSymlinksIfExists(dbVal)
+				if err != nil {
+					return fmt.Errorf("cannot evaluate symlinks on DB %s path %q: %w", fieldName, dbVal, err)
+				}
+				dbVal = checkedVal
+			}
+			if ourVal != "" {
+				checkedVal, err := evalSymlinksIfExists(ourVal)
+				if err != nil {
+					return fmt.Errorf("cannot evaluate symlinks on our %s path %q: %w", fieldName, ourVal, err)
+				}
+				ourVal = checkedVal
+			}
+		}
 
-	checkField := func(fieldName, dbVal, ourVal string) error {
 		if dbVal != ourVal {
 			return fmt.Errorf("database %s %q does not match our %s %q: %w", fieldName, dbVal, fieldName, ourVal, define.ErrDBBadConfig)
 		}
@@ -386,27 +413,33 @@ func (s *SQLiteState) ValidateDBConfig(runtime *Runtime) (defErr error) {
 		return nil
 	}
 
-	if err := checkField("os", os, runtimeOS); err != nil {
+	if err := checkField("os", dbOS, runtimeOS, false); err != nil {
 		return err
 	}
-	if err := checkField("static dir", staticDir, runtimeStaticDir); err != nil {
+	if err := checkField("static dir", staticDir, runtimeStaticDir, true); err != nil {
 		return err
 	}
-	if err := checkField("tmp dir", tmpDir, runtimeTmpDir); err != nil {
+	if err := checkField("tmp dir", tmpDir, runtimeTmpDir, true); err != nil {
 		return err
 	}
-	if err := checkField("graph root", graphRoot, runtimeGraphRoot); err != nil {
+	if err := checkField("graph root", graphRoot, runtimeGraphRoot, true); err != nil {
 		return err
 	}
-	if err := checkField("run root", runRoot, runtimeRunRoot); err != nil {
+	if err := checkField("run root", runRoot, runtimeRunRoot, true); err != nil {
 		return err
 	}
-	if err := checkField("graph driver", graphDriver, runtimeGraphDriver); err != nil {
+	if err := checkField("graph driver", graphDriver, runtimeGraphDriver, false); err != nil {
 		return err
 	}
-	if err := checkField("volume path", volumePath, runtimeVolumePath); err != nil {
+	if err := checkField("volume path", volumePath, runtimeVolumePath, true); err != nil {
 		return err
 	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing database validation row: %w", err)
+	}
+	// Do not return any error after the commit call because the defer will
+	// try to roll back the transaction which results in an logged error.
 
 	return nil
 }
@@ -935,8 +968,7 @@ func (s *SQLiteState) GetContainerExitCode(id string) (int32, error) {
 	}
 
 	row := s.conn.QueryRow("SELECT ExitCode FROM ContainerExitCode WHERE ID=?;", id)
-
-	var exitCode int32
+	var exitCode int32 = -1
 	if err := row.Scan(&exitCode); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return -1, fmt.Errorf("getting exit code of container %s from DB: %w", id, define.ErrNoSuchExitCode)
@@ -973,7 +1005,7 @@ func (s *SQLiteState) GetContainerExitCodeTimeStamp(id string) (*time.Time, erro
 	return &result, nil
 }
 
-// PruneExitCodes removes exit codes older than 5 minutes unless the associated
+// PruneContainerExitCodes removes exit codes older than 5 minutes unless the associated
 // container still exists.
 func (s *SQLiteState) PruneContainerExitCodes() (defErr error) {
 	if !s.valid {
@@ -1287,7 +1319,7 @@ func (s *SQLiteState) RewriteVolumeConfig(volume *Volume, newCfg *VolumeConfig) 
 		}
 	}()
 
-	results, err := tx.Exec("UPDATE VolumeConfig SET Name=?, JSON=? WHERE ID=?;", newCfg.Name, json, volume.Name())
+	results, err := tx.Exec("UPDATE VolumeConfig SET Name=?, JSON=? WHERE Name=?;", newCfg.Name, json, volume.Name())
 	if err != nil {
 		return fmt.Errorf("updating volume config table with new configuration for volume %s: %w", volume.Name(), err)
 	}
@@ -1696,6 +1728,10 @@ func (s *SQLiteState) RemovePodContainers(pod *Pod) (defErr error) {
 	}
 	if err := rows.Err(); err != nil {
 		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing pod containers %s removal transaction: %w", pod.ID(), err)
 	}
 
 	return nil
@@ -2121,6 +2157,7 @@ func (s *SQLiteState) Volume(name string) (*Volume, error) {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, define.ErrNoSuchVolume
 		}
+		return nil, fmt.Errorf("querying volume %s: %w", name, err)
 	}
 
 	vol := new(Volume)

@@ -89,11 +89,11 @@ func (vm *VirtualMachine) SplitAndAddIgnition(keyPrefix string, ignRdr *bytes.Re
 }
 
 func (vm *VirtualMachine) AddKeyValuePair(key string, value string) error {
-	return vm.kvpOperation("AddKvpItems", key, value, "key already exists?")
+	return vm.kvpOperation("AddKvpItems", key, value, false, "key already exists?")
 }
 
 func (vm *VirtualMachine) ModifyKeyValuePair(key string, value string) error {
-	return vm.kvpOperation("ModifyKvpItems", key, value, "key invalid?")
+	return vm.kvpOperation("ModifyKvpItems", key, value, false, "key invalid?")
 }
 
 func (vm *VirtualMachine) PutKeyValuePair(key string, value string) error {
@@ -107,14 +107,18 @@ func (vm *VirtualMachine) PutKeyValuePair(key string, value string) error {
 }
 
 func (vm *VirtualMachine) RemoveKeyValuePair(key string) error {
-	return vm.kvpOperation("RemoveKvpItems", key, "", "key invalid?")
+	return vm.kvpOperation("RemoveKvpItems", key, "", false, "key invalid?")
+}
+
+func (vm *VirtualMachine) RemoveKeyValuePairNoWait(key string) error {
+	return vm.kvpOperation("RemoveKvpItems", key, "", true, "key invalid?")
 }
 
 func (vm *VirtualMachine) GetKeyValuePairs() (map[string]string, error) {
 	var service *wmiext.Service
 	var err error
 
-	if service, err = wmiext.NewLocalService(HyperVNamespace); err != nil {
+	if service, err = NewLocalHyperVService(); err != nil {
 		return nil, err
 	}
 
@@ -148,12 +152,13 @@ func (vm *VirtualMachine) GetKeyValuePairs() (map[string]string, error) {
 	return parseKvpMapXml(s)
 }
 
-func (vm *VirtualMachine) kvpOperation(op string, key string, value string, illegalSuggestion string) error {
+func (vm *VirtualMachine) kvpOperation(op string, key string, value string, nowait bool, illegalSuggestion string) error {
 	var service *wmiext.Service
 	var vsms, job *wmiext.Instance
+	var ret int32
 	var err error
 
-	if service, err = wmiext.NewLocalService(HyperVNamespace); err != nil {
+	if service, err = NewLocalHyperVService(); err != nil {
 		return err
 	}
 	defer service.Close()
@@ -172,15 +177,26 @@ func (vm *VirtualMachine) kvpOperation(op string, key string, value string, ille
 	execution := vsms.BeginInvoke(op).
 		In("TargetSystem", vm.Path()).
 		In("DataItems", []string{itemStr}).
-		Execute()
+		Execute().
+		Out("ReturnValue", &ret).
+		Out("Job", &job)
 
-	if err := execution.Out("Job", &job).End(); err != nil {
+	if err := execution.End(); err != nil {
 		return fmt.Errorf("%s execution failed: %w", op, err)
 	}
 
-	err = translateKvpError(wmiext.WaitJob(service, job), illegalSuggestion)
 	defer job.Close()
-	return err
+	if ret == 0 || (nowait && ret == 4096) {
+		return nil
+	}
+
+	if ret == 4096 {
+		err = wmiext.WaitJob(service, job)
+	} else {
+		err = &wmiext.JobError{ErrorCode: int(ret)}
+	}
+
+	return translateKvpError(err, illegalSuggestion)
 }
 
 func waitVMResult(res int32, service *wmiext.Service, job *wmiext.Instance, errorMsg string, translate func(int) error) error {
@@ -226,7 +242,7 @@ func (vm *VirtualMachine) stop(force bool) error {
 		res int32
 		srv *wmiext.Service
 	)
-	if srv, err = wmiext.NewLocalService(HyperVNamespace); err != nil {
+	if srv, err = NewLocalHyperVService(); err != nil {
 		return err
 	}
 	wmiInst, err := srv.FindFirstRelatedInstance(vm.Path(), "Msvm_ShutdownComponent")
@@ -303,7 +319,7 @@ func (vm *VirtualMachine) Start() error {
 
 func getService(_ *wmiext.Service) (*wmiext.Service, error) {
 	// any reason why when we instantiate a vm, we should NOT just embed a service?
-	return wmiext.NewLocalService(HyperVNamespace)
+	return NewLocalHyperVService()
 }
 
 func (vm *VirtualMachine) GetConfig(diskPath string) (*HyperVConfig, error) {
@@ -350,7 +366,7 @@ func (vm *VirtualMachine) GetConfig(diskPath string) (*HyperVConfig, error) {
 // SummaryRequestCommon and SummaryRequestNearAll provide predefined combinations for this
 // parameter
 func (vm *VirtualMachine) GetSummaryInformation(requestedFields SummaryRequestSet) (*SummaryInformation, error) {
-	service, err := wmiext.NewLocalService(HyperVNamespace)
+	service, err := NewLocalHyperVService()
 	if err != nil {
 		return nil, err
 	}
@@ -469,7 +485,7 @@ func (vm *VirtualMachine) fetchExistingResourceSettings(service *wmiext.Service,
 }
 
 func (vm *VirtualMachine) getMemorySettings(m *MemorySettings) error {
-	service, err := wmiext.NewLocalService(HyperVNamespace)
+	service, err := NewLocalHyperVService()
 	if err != nil {
 		return err
 	}
@@ -479,7 +495,7 @@ func (vm *VirtualMachine) getMemorySettings(m *MemorySettings) error {
 
 // Update processor and/or mem
 func (vm *VirtualMachine) UpdateProcessorMemSettings(updateProcessor func(*ProcessorSettings), updateMemory func(*MemorySettings)) error {
-	service, err := wmiext.NewLocalService(HyperVNamespace)
+	service, err := NewLocalHyperVService()
 	if err != nil {
 		return err
 	}
@@ -552,11 +568,15 @@ func (vm *VirtualMachine) remove() (int32, error) {
 		srv *wmiext.Service
 	)
 
+	refreshVM, err := vm.vmm.GetMachine(vm.ElementName)
+	if err != nil {
+		return 0, err
+	}
 	// Check for disabled/stopped state
-	if !Disabled.equal(vm.EnabledState) {
+	if !Disabled.equal(refreshVM.EnabledState) {
 		return -1, ErrMachineStateInvalid
 	}
-	if srv, err = wmiext.NewLocalService(HyperVNamespace); err != nil {
+	if srv, err = NewLocalHyperVService(); err != nil {
 		return -1, err
 	}
 

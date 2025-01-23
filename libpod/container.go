@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -13,14 +12,13 @@ import (
 	"strings"
 	"time"
 
-	types040 "github.com/containernetworking/cni/pkg/types/040"
-	"github.com/containers/common/libnetwork/cni"
+	"github.com/containers/common/libnetwork/pasta"
 	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/common/pkg/secrets"
 	"github.com/containers/image/v5/manifest"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/lock"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/lock"
 	"github.com/containers/storage"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
@@ -49,44 +47,38 @@ const (
 	// InvalidNS is an invalid namespace
 	InvalidNS LinuxNS = iota
 	// IPCNS is the IPC namespace
-	IPCNS LinuxNS = iota
+	IPCNS
 	// MountNS is the mount namespace
-	MountNS LinuxNS = iota
+	MountNS
 	// NetNS is the network namespace
-	NetNS LinuxNS = iota
+	NetNS
 	// PIDNS is the PID namespace
-	PIDNS LinuxNS = iota
+	PIDNS
 	// UserNS is the user namespace
-	UserNS LinuxNS = iota
+	UserNS
 	// UTSNS is the UTS namespace
-	UTSNS LinuxNS = iota
+	UTSNS
 	// CgroupNS is the Cgroup namespace
-	CgroupNS LinuxNS = iota
+	CgroupNS
 )
 
 // String returns a string representation of a Linux namespace
 // It is guaranteed to be the name of the namespace in /proc for valid ns types
 func (ns LinuxNS) String() string {
-	switch ns {
-	case InvalidNS:
-		return "invalid"
-	case IPCNS:
-		return "ipc"
-	case MountNS:
-		return "mnt"
-	case NetNS:
-		return "net"
-	case PIDNS:
-		return "pid"
-	case UserNS:
-		return "user"
-	case UTSNS:
-		return "uts"
-	case CgroupNS:
-		return "cgroup"
-	default:
-		return "unknown"
+	s := [...]string{
+		InvalidNS: "invalid",
+		IPCNS:     "ipc",
+		MountNS:   "mnt",
+		NetNS:     "net",
+		PIDNS:     "pid",
+		UserNS:    "user",
+		UTSNS:     "uts",
+		CgroupNS:  "cgroup",
 	}
+	if ns >= 0 && int(ns) < len(s) {
+		return s[ns]
+	}
+	return "unknown"
 }
 
 // Container is a single OCI container.
@@ -120,6 +112,10 @@ type Container struct {
 	rootlessPortSyncR *os.File
 	rootlessPortSyncW *os.File
 
+	// reservedPorts contains the fds for the bound ports when using the
+	// bridge network mode as root.
+	reservedPorts []*os.File
+
 	// perNetworkOpts should be set when you want to use special network
 	// options when calling network setup/teardown. This should be used for
 	// container restore or network reload for example. Leave this nil if
@@ -130,6 +126,7 @@ type Container struct {
 	restoreFromCheckpoint bool
 
 	slirp4netnsSubnet *net.IPNet
+	pastaResult       *pasta.SetupResult
 }
 
 // ContainerState contains the current state of the container
@@ -176,13 +173,6 @@ type ContainerState struct {
 	LegacyExecSessions map[string]*legacyExecSession `json:"execSessions,omitempty"`
 	// NetNS is the path or name of the NetNS
 	NetNS string `json:"netns,omitempty"`
-	// NetworkStatusOld contains the configuration results for all networks
-	// the pod is attached to. Only populated if we created a network
-	// namespace for the container, and the network namespace is currently
-	// active.
-	// These are DEPRECATED and will be removed in a future release.
-	// This field is only used for backwarts compatibility.
-	NetworkStatusOld []*types040.Result `json:"networkResults,omitempty"`
 	// NetworkStatus contains the network Status for all networks
 	// the container is attached to. Only populated if we created a network
 	// namespace for the container, and the network namespace is currently
@@ -217,6 +207,9 @@ type ContainerState struct {
 	// healthcheck. The container will be restarted if this exceed a set
 	// number in the startup HC config.
 	StartupHCFailureCount int `json:"startupHCFailureCount,omitempty"`
+	// HCUnitName records the name of the healthcheck unit.
+	// Automatically generated when the healthcheck is started.
+	HCUnitName string `json:"hcUnitName,omitempty"`
 
 	// ExtensionStageHooks holds hooks which will be executed by libpod
 	// and not delegated to the OCI runtime.
@@ -258,7 +251,7 @@ type ContainerNamedVolume struct {
 	// This is used for emptyDir volumes from a kube yaml
 	IsAnonymous bool `json:"setAnonymous,omitempty"`
 	// SubPath determines which part of the Source will be mounted in the container
-	SubPath string
+	SubPath string `json:",omitempty"`
 }
 
 // ContainerOverlayVolume is an overlay volume that will be mounted into the
@@ -283,6 +276,8 @@ type ContainerImageVolume struct {
 	Dest string `json:"dest"`
 	// ReadWrite sets the volume writable.
 	ReadWrite bool `json:"rw"`
+	// SubPath determines which part of the image will be mounted into the container.
+	SubPath string `json:"subPath,omitempty"`
 }
 
 // ContainerSecret is a secret that is mounted in a container
@@ -671,8 +666,12 @@ func (c *Container) RuntimeName() string {
 // Runtime spec accessors
 // Unlocked
 
-// Hostname gets the container's hostname
-func (c *Container) Hostname() string {
+// hostname determines the container's hostname.
+// If 'network' is true and the container isn't running in a
+// private UTS namespoace, an empty string will be returned
+// instead of the host's hostname because we never want to
+// send the host's hostname to a DHCP or DNS server.
+func (c *Container) hostname(network bool) string {
 	if c.config.UTSNsCtr != "" {
 		utsNsCtr, err := c.runtime.GetContainer(c.config.UTSNsCtr)
 		if err != nil {
@@ -682,31 +681,64 @@ func (c *Container) Hostname() string {
 		}
 		return utsNsCtr.Hostname()
 	}
+
 	if c.config.Spec.Hostname != "" {
 		return c.config.Spec.Hostname
 	}
 
-	// if the container is not running in a private UTS namespace,
-	// return the host's hostname.
-	privateUTS := false
-	if c.config.Spec.Linux != nil {
-		for _, ns := range c.config.Spec.Linux.Namespaces {
-			if ns.Type == spec.UTSNamespace {
-				privateUTS = true
-				break
-			}
-		}
-	}
+	// If the container is not running in a private UTS namespace,
+	// return the host's hostname unless 'network' is true in which
+	// case we return an empty string.
+	privateUTS := c.hasPrivateUTS()
 	if !privateUTS {
 		hostname, err := os.Hostname()
 		if err == nil {
+			if network {
+				return ""
+			}
 			return hostname
 		}
+		logrus.Errorf("unable to get host's hostname for container %s: %v", c.ID(), err)
+		return ""
 	}
+
+	// If container_name_as_hostname is set in the CONTAINERS table in
+	// containers.conf, use a sanitized version of the container's name
+	// as the hostname.  Since the container name must already match
+	// the set '[a-zA-Z0-9][a-zA-Z0-9_.-]*', we can just remove any
+	// underscores and limit it to 253 characters to make it a valid
+	// hostname.
+	if c.runtime.config.Containers.ContainerNameAsHostName {
+		sanitizedHostname := strings.ReplaceAll(c.Name(), "_", "")
+		if len(sanitizedHostname) <= 253 {
+			return sanitizedHostname
+		}
+		return sanitizedHostname[:253]
+	}
+
+	// Otherwise use the container's short ID as the hostname.
 	if len(c.ID()) < 11 {
 		return c.ID()
 	}
 	return c.ID()[:12]
+}
+
+// Hostname gets the container's hostname
+func (c *Container) Hostname() string {
+	return c.hostname(false)
+}
+
+// If the container isn't running in a private UTS namespace, Hostname()
+// will return the host's hostname as the container's hostname. If netavark
+// were to try and obtain a DHCP lease with the host's hostname in an environment
+// where DDNS was active, bad things could happen. NetworkHostname() on the
+// other hand, will return an empty string if the container isn't running
+// in a private UTS namespace.
+//
+// This function should only be used to populate the ContainerHostname member
+// of the common.libnetwork.types.NetworkOptions struct.
+func (c *Container) NetworkHostname() string {
+	return c.hostname(true)
 }
 
 // WorkingDir returns the containers working dir
@@ -1268,6 +1300,17 @@ func (c *Container) AutoRemove() bool {
 	return spec.Annotations[define.InspectAnnotationAutoremove] == define.InspectResponseTrue
 }
 
+// AutoRemoveImage indicates that the container will automatically remove the
+// image it is using after it exits and is removed.
+// Only allowed if AutoRemove is true.
+func (c *Container) AutoRemoveImage() bool {
+	spec := c.config.Spec
+	if spec.Annotations == nil {
+		return false
+	}
+	return spec.Annotations[define.InspectAnnotationAutoremoveImage] == define.InspectResponseTrue
+}
+
 // Timezone returns the timezone configured inside the container.
 // Local means it has the same timezone as the host machine
 func (c *Container) Timezone() string {
@@ -1382,39 +1425,10 @@ func (c *Container) GetNetworkStatus() (map[string]types.StatusBlock, error) {
 	return c.getNetworkStatus(), nil
 }
 
-// getNetworkStatus get the current network status from the state. If the container
-// still uses the old network status it is converted to the new format. This function
+// getNetworkStatus get the current network status from the state. This function
 // should be used instead of reading c.state.NetworkStatus directly.
 func (c *Container) getNetworkStatus() map[string]types.StatusBlock {
-	if c.state.NetworkStatus != nil {
-		return c.state.NetworkStatus
-	}
-	if c.state.NetworkStatusOld != nil {
-		networks, err := c.networks()
-		if err != nil {
-			return nil
-		}
-		if len(networks) != len(c.state.NetworkStatusOld) {
-			return nil
-		}
-		result := make(map[string]types.StatusBlock, len(c.state.NetworkStatusOld))
-		i := 0
-		// Note: NetworkStatusOld does not contain the network names so we get them extra
-		// We cannot guarantee the same order but after a state refresh it should work
-		for netName := range networks {
-			status, err := cni.CNIResultToStatus(c.state.NetworkStatusOld[i])
-			if err != nil {
-				return nil
-			}
-			result[netName] = status
-			i++
-		}
-		c.state.NetworkStatus = result
-		_ = c.save()
-
-		return result
-	}
-	return nil
+	return c.state.NetworkStatus
 }
 
 func (c *Container) NamespaceMode(ns spec.LinuxNamespaceType, ctrSpec *spec.Spec) string {

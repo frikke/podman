@@ -1,5 +1,4 @@
 //go:build freebsd
-// +build freebsd
 
 package buildah
 
@@ -8,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"unsafe"
 
@@ -22,16 +22,17 @@ import (
 	"github.com/containers/buildah/pkg/parse"
 	butil "github.com/containers/buildah/pkg/util"
 	"github.com/containers/buildah/util"
+	"github.com/containers/common/libnetwork/etchosts"
 	"github.com/containers/common/libnetwork/resolvconf"
 	nettypes "github.com/containers/common/libnetwork/types"
+	netUtil "github.com/containers/common/libnetwork/util"
 	"github.com/containers/common/pkg/config"
-	cutil "github.com/containers/common/pkg/util"
+	"github.com/containers/image/v5/types"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/lockfile"
 	"github.com/containers/storage/pkg/stringid"
 	"github.com/docker/go-units"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -44,16 +45,14 @@ const (
 	PROC_REAP_RELEASE = 3
 )
 
-var (
-	// We dont want to remove destinations with /etc, /dev as
-	// rootfs already contains these files and unionfs will create
-	// a `whiteout` i.e `.wh` files on removal of overlapping
-	// files from these directories.  everything other than these
-	// will be cleaned up
-	nonCleanablePrefixes = []string{
-		"/etc", "/dev",
-	}
-)
+// We dont want to remove destinations with /etc, /dev as
+// rootfs already contains these files and unionfs will create
+// a `whiteout` i.e `.wh` files on removal of overlapping
+// files from these directories.  everything other than these
+// will be cleaned up
+var nonCleanablePrefixes = []string{
+	"/etc", "/dev",
+}
 
 func procctl(idtype int, id int, cmd int, arg *byte) error {
 	_, _, e1 := unix.Syscall6(
@@ -74,6 +73,24 @@ func setChildProcess() error {
 }
 
 func (b *Builder) Run(command []string, options RunOptions) error {
+	var runArtifacts *runMountArtifacts
+	if len(options.ExternalImageMounts) > 0 {
+		defer func() {
+			if runArtifacts == nil {
+				// we didn't add ExternalImageMounts to the
+				// list of images that we're going to unmount
+				// yet and make a deferred call that cleans
+				// them up, but the caller is expecting us to
+				// unmount these for them because we offered to
+				for _, image := range options.ExternalImageMounts {
+					if _, err := b.store.UnmountImage(image, false); err != nil {
+						logrus.Debugf("umounting image %q: %v", image, err)
+					}
+				}
+			}
+		}()
+	}
+
 	p, err := os.MkdirTemp(tmpdir.GetTempDir(), define.Package)
 	if err != nil {
 		return err
@@ -125,10 +142,16 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 		return err
 	}
 
+	workDir := b.WorkDir()
 	if options.WorkingDir != "" {
 		g.SetProcessCwd(options.WorkingDir)
+		workDir = options.WorkingDir
 	} else if b.WorkDir() != "" {
 		g.SetProcessCwd(b.WorkDir())
+		workDir = b.WorkDir()
+	}
+	if workDir == "" {
+		workDir = string(os.PathSeparator)
 	}
 	mountPoint, err := b.Mount(b.MountLabel)
 	if err != nil {
@@ -156,7 +179,11 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 
 	containerName := Package + "-" + filepath.Base(path)
 	if configureNetwork {
-		g.AddAnnotation("org.freebsd.parentJail", containerName+"-vnet")
+		if jail.NeedVnetJail() {
+			g.AddAnnotation("org.freebsd.parentJail", containerName+"-vnet")
+		} else {
+			g.AddAnnotation("org.freebsd.jail.vnet", "new")
+		}
 	}
 
 	homeDir, err := b.configureUIDGID(g, mountPoint, options)
@@ -179,7 +206,7 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 	uid, gid := spec.Process.User.UID, spec.Process.User.GID
 	idPair := &idtools.IDPair{UID: int(uid), GID: int(gid)}
 
-	mode := os.FileMode(0755)
+	mode := os.FileMode(0o755)
 	coptions := copier.MkdirOptions{
 		ChownNew: idPair,
 		ChmodNew: &mode,
@@ -198,24 +225,55 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 	}
 	rootIDPair := &idtools.IDPair{UID: int(rootUID), GID: int(rootGID)}
 
-	hostFile := ""
-	if !options.NoHosts && !cutil.StringInSlice(config.DefaultHostsFile, volumes) && options.ConfigureNetwork != define.NetworkDisabled {
-		hostFile, err = b.generateHosts(path, rootIDPair, mountPoint, spec)
+	hostsFile := ""
+	if !options.NoHosts && !slices.Contains(volumes, config.DefaultHostsFile) && options.ConfigureNetwork != define.NetworkDisabled {
+		hostsFile, err = b.createHostsFile(path, rootIDPair)
 		if err != nil {
 			return err
 		}
-		bindFiles[config.DefaultHostsFile] = hostFile
+		bindFiles[config.DefaultHostsFile] = hostsFile
+
+		// Only add entries here if we do not have to setup network,
+		// if we do we have to do it much later after the network setup.
+		if !configureNetwork {
+			var entries etchosts.HostEntries
+			// add host entry for local ip when running in host network
+			if spec.Hostname != "" {
+				ip := netUtil.GetLocalIP()
+				if ip != "" {
+					entries = append(entries, etchosts.HostEntry{
+						Names: []string{spec.Hostname},
+						IP:    ip,
+					})
+				}
+			}
+			err = b.addHostsEntries(hostsFile, mountPoint, entries, nil, "")
+			if err != nil {
+				return err
+			}
+		}
 	}
 
-	if !cutil.StringInSlice(resolvconf.DefaultResolvConf, volumes) && options.ConfigureNetwork != define.NetworkDisabled && !(len(b.CommonBuildOpts.DNSServers) == 1 && strings.ToLower(b.CommonBuildOpts.DNSServers[0]) == "none") {
-		resolvFile, err := b.addResolvConf(path, rootIDPair, b.CommonBuildOpts.DNSServers, b.CommonBuildOpts.DNSSearch, b.CommonBuildOpts.DNSOptions, nil)
+	resolvFile := ""
+	if !slices.Contains(volumes, resolvconf.DefaultResolvConf) && options.ConfigureNetwork != define.NetworkDisabled && !(len(b.CommonBuildOpts.DNSServers) == 1 && strings.ToLower(b.CommonBuildOpts.DNSServers[0]) == "none") {
+		resolvFile, err = b.createResolvConf(path, rootIDPair)
 		if err != nil {
 			return err
 		}
 		bindFiles[resolvconf.DefaultResolvConf] = resolvFile
+
+		// Only add entries here if we do not have to do setup network,
+		// if we do we have to do it much later after the network setup.
+		if !configureNetwork {
+			err = b.addResolvConfEntries(resolvFile, nil, spec, false, true)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	runMountInfo := runMountInfo{
+		WorkDir:          workDir,
 		ContextDir:       options.ContextDir,
 		Secrets:          options.Secrets,
 		SSHSources:       options.SSHSources,
@@ -223,7 +281,7 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 		SystemContext:    options.SystemContext,
 	}
 
-	runArtifacts, err := b.setupMounts(mountPoint, spec, path, options.Mounts, bindFiles, volumes, b.CommonBuildOpts.Volumes, options.RunMounts, runMountInfo)
+	runArtifacts, err = b.setupMounts(mountPoint, spec, path, options.Mounts, bindFiles, volumes, options.CompatBuiltinVolumes, b.CommonBuildOpts.Volumes, options.RunMounts, runMountInfo)
 	if err != nil {
 		return fmt.Errorf("resolving mountpoints for container %q: %w", b.ContainerID, err)
 	}
@@ -240,16 +298,18 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 	}
 
 	defer func() {
-		if err := b.cleanupRunMounts(options.SystemContext, mountPoint, runArtifacts); err != nil {
+		if err := b.cleanupRunMounts(mountPoint, runArtifacts); err != nil {
 			options.Logger.Errorf("unable to cleanup run mounts %v", err)
 		}
 	}()
 
 	defer b.cleanupTempVolumes()
 
-	// If we are creating a network, make the vnet here so that we
-	// can execute the OCI runtime inside it.
-	if configureNetwork {
+	// If we are creating a network, make the vnet here so that we can
+	// execute the OCI runtime inside it. For FreeBSD-13.3 and later, we can
+	// configure the container network settings from outside the jail, which
+	// removes the need for a separate jail to manage the vnet.
+	if configureNetwork && jail.NeedVnetJail() {
 		mynetns := containerName + "-vnet"
 
 		jconf := jail.NewConfig()
@@ -284,9 +344,9 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 		} else {
 			moreCreateArgs = nil
 		}
-		err = b.runUsingRuntimeSubproc(isolation, options, configureNetwork, networkString, moreCreateArgs, spec, mountPoint, path, containerName, b.Container, hostFile)
+		err = b.runUsingRuntimeSubproc(isolation, options, configureNetwork, networkString, moreCreateArgs, spec, mountPoint, path, containerName, b.Container, hostsFile, resolvFile)
 	case IsolationChroot:
-		err = chroot.RunUsingChroot(spec, path, homeDir, options.Stdin, options.Stdout, options.Stderr)
+		err = chroot.RunUsingChroot(spec, path, homeDir, options.Stdin, options.Stdout, options.Stderr, options.NoPivot)
 	default:
 		err = errors.New("don't know how to run this command")
 	}
@@ -309,13 +369,17 @@ func addCommonOptsToSpec(commonOpts *define.CommonBuildOptions, g *generate.Gene
 
 // setupSpecialMountSpecChanges creates special mounts for depending
 // on the namespaces - nothing yet for freebsd
-func setupSpecialMountSpecChanges(spec *spec.Spec, shmSize string) ([]specs.Mount, error) {
+func setupSpecialMountSpecChanges(spec *specs.Spec, shmSize string) ([]specs.Mount, error) {
 	return spec.Mounts, nil
 }
 
-// If this function succeeds and returns a non-nil *lockfile.LockFile, the caller must unlock it (when??).
-func (b *Builder) getCacheMount(tokens []string, stageMountPoints map[string]internal.StageMountDetails, idMaps IDMaps, workDir string) (*spec.Mount, *lockfile.LockFile, error) {
-	return nil, nil, errors.New("cache mounts not supported on freebsd")
+// If this succeeded, the caller would be expected to, after the command which
+// uses the mount exits, clean up the overlay filesystem (if we returned one),
+// unmount the mounted filesystem (if we provided the path to its mountpoint)
+// and remove its mountpoint, unmount the image (if we mounted one), and
+// release the lock (if we took one).
+func (b *Builder) getCacheMount(tokens []string, sys *types.SystemContext, stageMountPoints map[string]internal.StageMountDetails, idMaps IDMaps, workDir, tmpDir string) (*specs.Mount, string, string, string, *lockfile.LockFile, error) {
+	return nil, "", "", "", nil, errors.New("cache mounts not supported on freebsd")
 }
 
 func (b *Builder) runSetupVolumeMounts(mountLabel string, volumeMounts []string, optionMounts []specs.Mount, idMaps IDMaps) (mounts []specs.Mount, Err error) {
@@ -411,7 +475,7 @@ func setupCapabilities(g *generate.Generator, defaultCapabilities, adds, drops [
 	return nil
 }
 
-func (b *Builder) runConfigureNetwork(pid int, isolation define.Isolation, options RunOptions, networkString string, containerName string) (teardown func(), netStatus map[string]nettypes.StatusBlock, err error) {
+func (b *Builder) runConfigureNetwork(pid int, isolation define.Isolation, options RunOptions, networkString string, containerName string, hostnames []string) (func(), *netResult, error) {
 	//if isolation == IsolationOCIRootless {
 	//return setupRootlessNetwork(pid)
 	//}
@@ -426,7 +490,12 @@ func (b *Builder) runConfigureNetwork(pid int, isolation define.Isolation, optio
 	}
 	logrus.Debugf("configureNetworks: %v", configureNetworks)
 
-	mynetns := containerName + "-vnet"
+	var mynetns string
+	if jail.NeedVnetJail() {
+		mynetns = containerName + "-vnet"
+	} else {
+		mynetns = containerName
+	}
 
 	networks := make(map[string]nettypes.PerNetworkOptions, len(configureNetworks))
 	for i, network := range configureNetworks {
@@ -440,19 +509,19 @@ func (b *Builder) runConfigureNetwork(pid int, isolation define.Isolation, optio
 		ContainerName: containerName,
 		Networks:      networks,
 	}
-	_, err = b.NetworkInterface.Setup(mynetns, nettypes.SetupOptions{NetworkOptions: opts})
+	netStatus, err := b.NetworkInterface.Setup(mynetns, nettypes.SetupOptions{NetworkOptions: opts})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	teardown = func() {
+	teardown := func() {
 		err := b.NetworkInterface.Teardown(mynetns, nettypes.TeardownOptions{NetworkOptions: opts})
 		if err != nil {
 			logrus.Errorf("failed to cleanup network: %v", err)
 		}
 	}
 
-	return teardown, nil, nil
+	return teardown, netStatusToNetResult(netStatus, hostnames), nil
 }
 
 func setupNamespaces(logger *logrus.Logger, g *generate.Generator, namespaceOptions define.NamespaceOptions, idmapOptions define.IDMappingOptions, policy define.NetworkConfigurationPolicy) (configureNetwork bool, networkString string, configureUTS bool, err error) {
@@ -493,7 +562,7 @@ func (b *Builder) configureNamespaces(g *generate.Generator, options *RunOptions
 	namespaceOptions.AddOrReplace(options.NamespaceOptions...)
 
 	networkPolicy := options.ConfigureNetwork
-	//Nothing was specified explicitly so network policy should be inherited from builder
+	// Nothing was specified explicitly so network policy should be inherited from builder
 	if networkPolicy == NetworkDefault {
 		networkPolicy = b.ConfigureNetwork
 

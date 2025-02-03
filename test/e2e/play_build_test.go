@@ -1,5 +1,4 @@
-//go:build !remote_testing
-// +build !remote_testing
+//go:build !remote_testing && (linux || freebsd)
 
 // build for play kube is not supported on remote yet.
 
@@ -9,9 +8,10 @@ import (
 	"os"
 	"path/filepath"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega/gexec"
 )
 
 var _ = Describe("Podman play kube with build", func() {
@@ -85,7 +85,10 @@ LABEL marge=mom
 
 		session := podmanTest.Podman([]string{"kube", "play", "top.yaml"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitCleanly())
+		Expect(session).Should(Exit(0))
+		stdErrString := session.ErrorToString()
+		Expect(stdErrString).To(ContainSubstring("Getting image source signatures"))
+		Expect(stdErrString).To(ContainSubstring("Writing manifest to image destination"))
 
 		exists := podmanTest.Podman([]string{"image", "exists", "foobar"})
 		exists.WaitWithDefaultTimeout()
@@ -122,7 +125,10 @@ LABEL marge=mom
 
 		session := podmanTest.Podman([]string{"kube", "play", "top.yaml"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitCleanly())
+		Expect(session).Should(Exit(0))
+		stdErrString := session.ErrorToString()
+		Expect(stdErrString).To(ContainSubstring("Getting image source signatures"))
+		Expect(stdErrString).To(ContainSubstring("Writing manifest to image destination"))
 
 		exists := podmanTest.Podman([]string{"image", "exists", "foobar"})
 		exists.WaitWithDefaultTimeout()
@@ -266,7 +272,10 @@ LABEL marge=mom
 
 		session := podmanTest.Podman([]string{"kube", "play", "--build", "top.yaml"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitCleanly())
+		Expect(session).Should(Exit(0))
+		stdErrString := session.ErrorToString()
+		Expect(stdErrString).To(ContainSubstring("Getting image source signatures"))
+		Expect(stdErrString).To(ContainSubstring("Writing manifest to image destination"))
 
 		inspect := podmanTest.Podman([]string{"container", "inspect", "top_pod-foobar"})
 		inspect.WaitWithDefaultTimeout()
@@ -351,7 +360,10 @@ echo GOT-HERE
 
 		session := podmanTest.Podman([]string{"kube", "play", "echo.yaml"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitCleanly())
+		Expect(session).Should(Exit(0))
+		stdErrString := session.ErrorToString()
+		Expect(stdErrString).To(ContainSubstring("Getting image source signatures"))
+		Expect(stdErrString).To(ContainSubstring("Writing manifest to image destination"))
 
 		cid := "echo_pod-foobar"
 		wait := podmanTest.Podman([]string{"wait", cid})

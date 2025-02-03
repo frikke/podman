@@ -1,5 +1,4 @@
-//go:build remote_testing
-// +build remote_testing
+//go:build remote_testing && (linux || freebsd)
 
 package integration
 
@@ -14,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -22,36 +22,25 @@ func IsRemote() bool {
 	return true
 }
 
-// Podman is the exec call to podman on the filesystem
+// Podman executes podman on the filesystem with default options.
 func (p *PodmanTestIntegration) Podman(args []string) *PodmanSessionIntegration {
-	args = p.makeOptions(args, false, false)
-	podmanSession := p.PodmanBase(args, false, false)
-	return &PodmanSessionIntegration{podmanSession}
+	return p.PodmanWithOptions(PodmanExecOptions{}, args...)
 }
 
-// PodmanSystemdScope runs the podman command in a new systemd scope
-func (p *PodmanTestIntegration) PodmanSystemdScope(args []string) *PodmanSessionIntegration {
-	args = p.makeOptions(args, false, false)
-
-	wrapper := []string{"systemd-run", "--scope"}
-	if isRootless() {
-		wrapper = []string{"systemd-run", "--scope", "--user"}
-	}
-
-	podmanSession := p.PodmanAsUserBase(args, 0, 0, "", nil, false, false, wrapper, nil)
-	return &PodmanSessionIntegration{podmanSession}
-}
-
-// PodmanExtraFiles is the exec call to podman on the filesystem and passes down extra files
-func (p *PodmanTestIntegration) PodmanExtraFiles(args []string, extraFiles []*os.File) *PodmanSessionIntegration {
-	args = p.makeOptions(args, false, false)
-	podmanSession := p.PodmanAsUserBase(args, 0, 0, "", nil, false, false, nil, extraFiles)
+// PodmanWithOptions executes podman on the filesystem with the supplied options.
+func (p *PodmanTestIntegration) PodmanWithOptions(options PodmanExecOptions, args ...string) *PodmanSessionIntegration {
+	args = p.makeOptions(args, options)
+	podmanSession := p.PodmanExecBaseWithOptions(args, options)
 	return &PodmanSessionIntegration{podmanSession}
 }
 
 func (p *PodmanTestIntegration) setDefaultRegistriesConfigEnv() {
-	defaultFile := filepath.Join(INTEGRATION_ROOT, "test/registries.conf")
-	os.Setenv("CONTAINERS_REGISTRIES_CONF", defaultFile)
+	defaultFile := "registries.conf"
+	if UsingCacheRegistry() {
+		defaultFile = "registries-cached.conf"
+	}
+	defaultPath := filepath.Join(INTEGRATION_ROOT, "test", defaultFile)
+	os.Setenv("CONTAINERS_REGISTRIES_CONF", defaultPath)
 }
 
 func (p *PodmanTestIntegration) setRegistriesConfigEnv(b []byte) {
@@ -100,7 +89,7 @@ func (p *PodmanTestIntegration) StartRemoteService() {
 }
 
 func (p *PodmanTestIntegration) StopRemoteService() {
-	if err := p.RemoteSession.Kill(); err != nil {
+	if err := p.RemoteSession.Signal(syscall.SIGTERM); err != nil {
 		GinkgoWriter.Printf("unable to clean up service %d, %v\n", p.RemoteSession.Pid, err)
 	}
 	if _, err := p.RemoteSession.Wait(); err != nil {

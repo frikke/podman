@@ -1,14 +1,17 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
+	"time"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	. "github.com/onsi/gomega/gexec"
 )
 
 var pruneImage = fmt.Sprintf(`
@@ -22,6 +25,11 @@ FROM scratch
 ENV test1=test1
 ENV test2=test2`
 
+var longBuildImage = fmt.Sprintf(`
+FROM %s
+RUN echo "Hello, World!"
+RUN RUN echo "Please use signal 9 this will never ends" && sleep 10000s`, ALPINE)
+
 var _ = Describe("Podman prune", func() {
 
 	It("podman container prune containers", func() {
@@ -34,9 +42,7 @@ var _ = Describe("Podman prune", func() {
 		Expect(top).Should(ExitCleanly())
 		cid := top.OutputToString()
 
-		stop := podmanTest.Podman([]string{"stop", cid})
-		stop.WaitWithDefaultTimeout()
-		Expect(stop).Should(ExitCleanly())
+		podmanTest.StopContainer(cid)
 
 		prune := podmanTest.Podman([]string{"container", "prune", "-f"})
 		prune.WaitWithDefaultTimeout()
@@ -220,10 +226,7 @@ var _ = Describe("Podman prune", func() {
 		session = podmanTest.Podman([]string{"pod", "start", podid1})
 		session.WaitWithDefaultTimeout()
 		Expect(session).Should(ExitCleanly())
-
-		session = podmanTest.Podman([]string{"pod", "stop", podid1})
-		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitCleanly())
+		podmanTest.StopPod(podid1)
 
 		pods := podmanTest.Podman([]string{"pod", "ps"})
 		pods.WaitWithDefaultTimeout()
@@ -294,10 +297,7 @@ var _ = Describe("Podman prune", func() {
 		session = podmanTest.Podman([]string{"pod", "start", podid1})
 		session.WaitWithDefaultTimeout()
 		Expect(session).Should(ExitCleanly())
-
-		session = podmanTest.Podman([]string{"pod", "stop", podid1})
-		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitCleanly())
+		podmanTest.StopPod(podid1)
 
 		// Create a container. This container should be pruned.
 		create := podmanTest.Podman([]string{"create", "--name", "test", BB})
@@ -327,10 +327,7 @@ var _ = Describe("Podman prune", func() {
 		session = podmanTest.Podman([]string{"pod", "start", podid1})
 		session.WaitWithDefaultTimeout()
 		Expect(session).Should(ExitCleanly())
-
-		session = podmanTest.Podman([]string{"pod", "stop", podid1})
-		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitCleanly())
+		podmanTest.StopPod(podid1)
 
 		// Start a pod and leave it running
 		session = podmanTest.Podman([]string{"pod", "create"})
@@ -406,9 +403,7 @@ var _ = Describe("Podman prune", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session).Should(ExitCleanly())
 
-		session = podmanTest.Podman([]string{"pod", "stop", podid1})
-		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitCleanly())
+		podmanTest.StopPod(podid1)
 
 		// Create a container. This container should be pruned.
 		create := podmanTest.Podman([]string{"create", "--name", "test", BB})
@@ -505,8 +500,7 @@ var _ = Describe("Podman prune", func() {
 	It("podman system prune --all --external fails", func() {
 		prune := podmanTest.Podman([]string{"system", "prune", "--all", "--external"})
 		prune.WaitWithDefaultTimeout()
-		Expect(prune).Should(Exit(125))
-		Expect(prune.ErrorToString()).To(ContainSubstring("--external cannot be combined with other options"))
+		Expect(prune).Should(ExitWithError(125, "--external cannot be combined with other options"))
 	})
 
 	It("podman system prune --external leaves referenced containers", func() {
@@ -592,5 +586,64 @@ var _ = Describe("Podman prune", func() {
 		dirents, err = os.ReadDir(containerStorageDir)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(dirents).To(HaveLen(3))
+	})
+
+	It("podman system prune --build clean up after terminated build", func() {
+		useCustomNetworkDir(podmanTest, tempdir)
+
+		podmanTest.BuildImage(pruneImage, "alpine_notleaker:latest", "false")
+
+		create := podmanTest.Podman([]string{"create", "--name", "test", BB, "sleep", "10000"})
+		create.WaitWithDefaultTimeout()
+		Expect(create).Should(ExitCleanly())
+
+		containerFilePath := filepath.Join(podmanTest.TempDir, "ContainerFile-podman-leaker")
+		err := os.WriteFile(containerFilePath, []byte(longBuildImage), 0755)
+		Expect(err).ToNot(HaveOccurred())
+
+		build := podmanTest.Podman([]string{"build", "-f", containerFilePath, "-t", "podmanleaker"})
+		// Build will never finish so let's wait for build to ask for SIGKILL to simulate a failed build that leaves stage containers.
+		matchedOutput := false
+		for range 900 {
+			if build.LineInOutputContains("Please use signal 9") {
+				matchedOutput = true
+				build.Signal(syscall.SIGKILL)
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !matchedOutput {
+			Fail("Did not match special string in podman build")
+		}
+
+		// Check Intermediate image of stage container
+		none := podmanTest.Podman([]string{"images", "-a"})
+		none.WaitWithDefaultTimeout()
+		Expect(none).Should(ExitCleanly())
+		Expect(none.OutputToString()).Should(ContainSubstring("none"))
+
+		// Check if Container and Stage Container exist
+		count := podmanTest.Podman([]string{"ps", "-aq", "--external"})
+		count.WaitWithDefaultTimeout()
+		Expect(count).Should(ExitCleanly())
+		Expect(count.OutputToStringArray()).To(HaveLen(3))
+
+		prune := podmanTest.Podman([]string{"system", "prune", "--build", "-f"})
+		prune.WaitWithDefaultTimeout()
+		Expect(prune).Should(ExitCleanly())
+
+		// Container should still exist, but no stage containers
+		count = podmanTest.Podman([]string{"ps", "-aq", "--external"})
+		count.WaitWithDefaultTimeout()
+		Expect(count).Should(ExitCleanly())
+		Expect(count.OutputToString()).To(BeEmpty())
+
+		Expect(podmanTest.NumberOfContainers()).To(Equal(0))
+
+		after := podmanTest.Podman([]string{"images", "-a"})
+		after.WaitWithDefaultTimeout()
+		Expect(after).Should(ExitCleanly())
+		Expect(after.OutputToString()).ShouldNot(ContainSubstring("none"))
+		Expect(after.OutputToString()).Should(ContainSubstring("notleaker"))
 	})
 })

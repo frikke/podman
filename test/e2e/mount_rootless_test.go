@@ -1,7 +1,11 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
-	. "github.com/containers/podman/v4/test/utils"
+	"slices"
+
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -21,8 +25,7 @@ var _ = Describe("Podman mount", func() {
 
 		mount := podmanTest.Podman([]string{"mount", cid})
 		mount.WaitWithDefaultTimeout()
-		Expect(mount).To(ExitWithError())
-		Expect(mount.ErrorToString()).To(ContainSubstring("podman unshare"))
+		Expect(mount).To(ExitWithError(125, "must execute `podman unshare` first"))
 	})
 
 	It("podman unshare podman mount", func() {
@@ -33,7 +36,7 @@ var _ = Describe("Podman mount", func() {
 
 		// command: podman <options> unshare podman <options> mount cid
 		args := []string{"unshare", podmanTest.PodmanBinary}
-		opts := podmanTest.PodmanMakeOptions([]string{"mount", cid}, false, false)
+		opts := podmanTest.PodmanMakeOptions([]string{"mount", cid}, PodmanExecOptions{})
 		args = append(args, opts...)
 
 		// container root file system location is podmanTest.TempDir/...
@@ -48,8 +51,7 @@ var _ = Describe("Podman mount", func() {
 		podmanTest.AddImageToRWStore(ALPINE)
 		mount := podmanTest.Podman([]string{"image", "mount", ALPINE})
 		mount.WaitWithDefaultTimeout()
-		Expect(mount).To(ExitWithError())
-		Expect(mount.ErrorToString()).To(ContainSubstring("podman unshare"))
+		Expect(mount).To(ExitWithError(125, "must execute `podman unshare` first"))
 	})
 
 	It("podman unshare image podman mount", func() {
@@ -57,7 +59,7 @@ var _ = Describe("Podman mount", func() {
 
 		// command: podman <options> unshare podman <options> image mount IMAGE
 		args := []string{"unshare", podmanTest.PodmanBinary}
-		opts := podmanTest.PodmanMakeOptions([]string{"image", "mount", CITEST_IMAGE}, false, false)
+		opts := podmanTest.PodmanMakeOptions([]string{"image", "mount", CITEST_IMAGE}, PodmanExecOptions{})
 		args = append(args, opts...)
 
 		// image location is podmanTest.TempDir/... because "--root podmanTest.TempDir/..."
@@ -65,5 +67,14 @@ var _ = Describe("Podman mount", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session).Should(ExitCleanly())
 		Expect(session.OutputToString()).To(ContainSubstring(podmanTest.TempDir))
+
+		// We have to unmount the image again otherwise we leak the tmpdir
+		// as active mount points cannot be removed.
+		index := slices.Index(args, "mount")
+		Expect(index).To(BeNumerically(">", 0), "index should be found")
+		args[index] = "unmount"
+		session = podmanTest.Podman(args)
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
 	})
 })

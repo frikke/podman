@@ -5,7 +5,7 @@ import (
 	"net"
 	"net/url"
 
-	"github.com/containers/podman/v4/pkg/bindings/internal/util"
+	"github.com/containers/podman/v5/pkg/bindings/internal/util"
 )
 
 // Changed returns true if named field has been set
@@ -106,6 +106,21 @@ func (o *PlayOptions) GetNetwork() []string {
 		return z
 	}
 	return *o.Network
+}
+
+// WithNoHostname set field NoHostname to given value
+func (o *PlayOptions) WithNoHostname(value bool) *PlayOptions {
+	o.NoHostname = &value
+	return o
+}
+
+// GetNoHostname returns value of field NoHostname
+func (o *PlayOptions) GetNoHostname() bool {
+	if o.NoHostname == nil {
+		var z bool
+		return z
+	}
+	return *o.NoHostname
 }
 
 // WithNoHosts set field NoHosts to given value

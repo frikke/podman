@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -16,7 +16,7 @@ func TestPodOptions(t *testing.T) {
 
 	podOptions := entities.PodCreateOptions{}
 	err := common.ContainerToPodOptions(&exampleOptions, &podOptions)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	cc := reflect.ValueOf(&exampleOptions).Elem()
 	pc := reflect.ValueOf(&podOptions).Elem()
